@@ -1,5 +1,6 @@
 #include "AsstCaller.h"
 
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <stdio.h>
@@ -66,9 +67,16 @@ int main([[maybe_unused]] int argc, char** argv)
         return -1;
     }
 
+    if (const char* task_name = std::getenv("MAA_DEBUG_DEMO_TASK"); task_name && *task_name) {
+        const char* task_params = std::getenv("MAA_DEBUG_DEMO_TASK_PARAMS");
+        AsstAppendTask(ptr, task_name, task_params && *task_params ? task_params : nullptr);
+    }
 #ifdef ASST_DEBUG
-    AsstAppendTask(ptr, "Debug", nullptr);
+    else {
+        AsstAppendTask(ptr, "Debug", nullptr);
+    }
 #else
+    else {
     /* 详细参数可参考 docs / 集成文档.md */
     AsstAppendTask(ptr, "StartUp", nullptr);
 
@@ -126,6 +134,7 @@ int main([[maybe_unused]] int argc, char** argv)
         "core_char": "维什戴尔"
     }
     )");
+    }
 #endif
 
     AsstStart(ptr);

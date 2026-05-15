@@ -11,6 +11,9 @@ struct RoguelikeRecruitInfo
     std::string name;          // 干员名字
     int priority = 0;          // 招募优先级 (0-1000)
     int page_index = 0;        // 所在页码 (用于判断翻页方向)
+    int elite = 0;             // 当前招募界面识别到的精英化等级
+    int level = 0;             // 当前招募界面识别到的等级
+    std::vector<std::string> groups; // 所属策略组，供 VLM 决策
     bool is_alternate = false; // 是否后备干员 (允许重复招募、划到后备干员时不再往右划动)
 };
 

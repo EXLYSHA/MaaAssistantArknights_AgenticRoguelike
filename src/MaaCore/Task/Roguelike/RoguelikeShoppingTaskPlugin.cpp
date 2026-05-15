@@ -7,6 +7,7 @@
 #include "Config/TaskData.h"
 #include "Controller/Controller.h"
 #include "Task/ProcessTask.h"
+#include "Task/Roguelike/VLMAgent/RoguelikeVLMAgentPlugin.h"
 #include "Utils/Logger.hpp"
 #include "Vision/Matcher.h"
 #include "Vision/OCRer.h"
@@ -126,6 +127,90 @@ bool asst::RoguelikeShoppingTaskPlugin::buy_once()
     std::vector<std::string> all_foldartal = m_config->get_theme() == RoguelikeTheme::Sami
                                                  ? Task.get<OcrTaskInfo>("Sami@Roguelike@FoldartalGainOcr")->text
                                                  : std::vector<std::string>();
+    struct VLMShopCandidate
+    {
+        std::string name;
+        std::string type = "unknown";
+        Rect rect;
+        const RoguelikeGoods* goods = nullptr;
+    };
+    std::vector<VLMShopCandidate> vlm_candidates;
+    vlm_candidates.reserve(result.size());
+    for (const auto& item : result) {
+        const RoguelikeGoods* matched_goods = nullptr;
+        for (const auto& goods : all_goods) {
+            if (item.text.find(goods.name) != std::string::npos || goods.name.find(item.text) != std::string::npos) {
+                matched_goods = &goods;
+                break;
+            }
+        }
+        VLMShopCandidate candidate;
+        candidate.name = matched_goods ? matched_goods->name : item.text;
+        candidate.type = matched_goods ? (matched_goods->promotion != 0 ? "promote" : "relic") : "unknown";
+        candidate.rect = item.rect;
+        candidate.goods = matched_goods;
+        vlm_candidates.emplace_back(std::move(candidate));
+    }
+
+    if (m_config->get_mode() == RoguelikeMode::VLMAgent && !vlm_candidates.empty()) {
+        if (auto vlm = m_config->get_vlm_agent(); vlm && vlm->enabled() && !vlm->session_id().empty()) {
+            json::value ctx;
+            ctx["floor"] = m_config->status().floor;
+            ctx["hope"] = m_config->status().hope;
+            ctx["current_roster_summary"] = vlm->current_roster_summary();
+            ctx["current_relics"] = vlm->current_relics_context();
+
+            json::array shop_items;
+            for (size_t index = 0; index < vlm_candidates.size(); ++index) {
+                const auto& candidate = vlm_candidates[index];
+                json::value item;
+                item["index"] = static_cast<int>(index);
+                item["name"] = candidate.name;
+                item["price"] = 0;
+                item["type"] = candidate.type;
+                shop_items.emplace_back(std::move(item));
+            }
+            ctx["shop_items"] = std::move(shop_items);
+
+            auto resp = vlm->request_decision("/decide/shopping", image, ctx);
+            if (resp && resp->is_object()) {
+                const auto& obj = resp->as_object();
+                auto action = obj.find("action");
+                auto purchases = obj.find("purchases");
+                if (action && action->is_string() && action->as_string() == "buy_list" && purchases &&
+                    purchases->is_array()) {
+                    for (const auto& purchase : purchases->as_array()) {
+                        if (!purchase.is_number()) {
+                            continue;
+                        }
+                        const int index = purchase.as_integer();
+                        if (index < 0 || static_cast<size_t>(index) >= vlm_candidates.size()) {
+                            continue;
+                        }
+
+                        const auto& candidate = vlm_candidates[index];
+                        Log.info("VLM ready to buy", candidate.name, "index", index);
+                        ctrler()->click(candidate.rect);
+                        if (m_config->get_theme() == RoguelikeTheme::Sami) {
+                            auto iter = std::find(all_foldartal.begin(), all_foldartal.end(), candidate.name);
+                            if (iter != all_foldartal.end()) {
+                                m_config->status().foldartal_list.emplace_back(candidate.name);
+                            }
+                        }
+                        m_config->status().collections.emplace_back(candidate.name);
+                        if (candidate.goods && candidate.goods->no_longer_buy) {
+                            m_config->status().trader_no_longer_buy = true;
+                        }
+                        return true;
+                    }
+
+                    Log.info("VLM shopping decision: buy nothing");
+                    return true;
+                }
+            }
+        }
+    }
+
     for (const auto& goods : all_goods) {
         if (need_exit()) {
             return false;
@@ -231,4 +316,3 @@ bool asst::RoguelikeShoppingTaskPlugin::buy_once()
     */
     return true;
 }
-

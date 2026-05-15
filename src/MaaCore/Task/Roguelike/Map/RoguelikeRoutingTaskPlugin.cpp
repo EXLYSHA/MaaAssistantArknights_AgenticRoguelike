@@ -2,17 +2,82 @@
 
 #include <limits>
 #include <numeric>
+#include <unordered_set>
 
 #include "Config/TaskData.h"
 #include "Controller/Controller.h"
 #include "MaaUtils/ImageIo.h"
 #include "MaaUtils/NoWarningCV.hpp"
 #include "Task/ProcessTask.h"
+#include "Task/Roguelike/VLMAgent/RoguelikeVLMAgentPlugin.h"
 #include "Utils/DebugImageHelper.hpp"
 #include "Utils/Logger.hpp"
 #include "Vision/Matcher.h"
 #include "Vision/Miscellaneous/PixelAnalyzer.h"
 #include "Vision/MultiMatcher.h"
+
+namespace
+{
+std::string vlm_node_type(asst::RoguelikeNodeType type)
+{
+    switch (type) {
+    case asst::RoguelikeNodeType::CombatOps:
+        return "battle";
+    case asst::RoguelikeNodeType::EmergencyOps:
+        return "elite";
+    case asst::RoguelikeNodeType::DreadfulFoe:
+        return "boss";
+    case asst::RoguelikeNodeType::Encounter:
+    case asst::RoguelikeNodeType::Recreation:
+    case asst::RoguelikeNodeType::Scout:
+    case asst::RoguelikeNodeType::Prophecy:
+    case asst::RoguelikeNodeType::FaceOff:
+        return "encounter";
+    case asst::RoguelikeNodeType::Boons:
+        return "boon";
+    case asst::RoguelikeNodeType::SafeHouse:
+        return "safehouse";
+    case asst::RoguelikeNodeType::RogueTrader:
+        return "shop";
+    case asst::RoguelikeNodeType::IdeaFilter:
+        return "filter";
+    case asst::RoguelikeNodeType::BoskyPassage:
+        return "passage";
+    default:
+        return "unknown";
+    }
+}
+
+std::string sarkaz_routing_action_for_node(asst::RoguelikeNodeType type)
+{
+    switch (type) {
+    case asst::RoguelikeNodeType::CombatOps:
+        return "Sarkaz@Roguelike@StageCombatOpsEnter";
+    case asst::RoguelikeNodeType::EmergencyOps:
+        return "Sarkaz@Roguelike@StageEmergencyOpsEnter";
+    case asst::RoguelikeNodeType::DreadfulFoe:
+        return "Sarkaz@Roguelike@StageDreadfulFoeEnter";
+    case asst::RoguelikeNodeType::Encounter:
+    case asst::RoguelikeNodeType::Recreation:
+    case asst::RoguelikeNodeType::Scout:
+    case asst::RoguelikeNodeType::Prophecy:
+    case asst::RoguelikeNodeType::FaceOff:
+        return "Sarkaz@RoguelikeRoutingAction-StageEncounterEnter";
+    case asst::RoguelikeNodeType::Boons:
+        return "Sarkaz@Roguelike@StageBoonsEnter";
+    case asst::RoguelikeNodeType::SafeHouse:
+        return "Sarkaz@Roguelike@StageSafeHouseEnter";
+    case asst::RoguelikeNodeType::RogueTrader:
+        return "Sarkaz@RoguelikeRoutingAction-StageTraderEnter";
+    case asst::RoguelikeNodeType::IdeaFilter:
+        return "Sarkaz@Roguelike@StageFilterTruthEnter";
+    case asst::RoguelikeNodeType::BoskyPassage:
+        return "Sarkaz@Roguelike@StageBoskyPassageEnter";
+    default:
+        return "";
+    }
+}
+} // namespace
 
 bool asst::RoguelikeRoutingTaskPlugin::load_params([[maybe_unused]] const json::value& params)
 {
@@ -39,6 +104,11 @@ bool asst::RoguelikeRoutingTaskPlugin::load_params([[maybe_unused]] const json::
     const std::string squad = params.get("squad", "");
 
     if (theme == RoguelikeTheme::Sarkaz && mode == RoguelikeMode::FastPass && squad == "蓝图测绘分队") {
+        m_routing_strategy = RoutingStrategy::Sarkaz_FastPass;
+        return true;
+    }
+
+    if (theme == RoguelikeTheme::Sarkaz && mode == RoguelikeMode::VLMAgent) {
         m_routing_strategy = RoutingStrategy::Sarkaz_FastPass;
         return true;
     }
@@ -548,9 +618,75 @@ void asst::RoguelikeRoutingTaskPlugin::navigate_route()
 
     m_map.update_node_costs();
 
-    const size_t next_node = m_map.get_next_node();
+    size_t next_node = m_map.get_next_node();
+    bool vlm_chosen = false;
 
-    if (m_map.get_node_cost(next_node) >= 1000) {
+    if (m_config->get_mode() == RoguelikeMode::VLMAgent) {
+        if (auto vlm = m_config->get_vlm_agent(); vlm && vlm->enabled() && !vlm->session_id().empty()) {
+            const size_t curr_node = m_map.get_curr_pos();
+            const auto reachable_nodes = m_map.get_node_succs(curr_node);
+            std::unordered_set<size_t> reachable_set(reachable_nodes.begin(), reachable_nodes.end());
+
+            json::value ctx;
+            ctx["floor"] = m_config->status().floor;
+            ctx["hope"] = m_config->status().hope;
+            ctx["hp"] = m_config->status().hp;
+            ctx["current_roster_summary"] = vlm->current_roster_summary();
+
+            json::array path_so_far;
+            if (curr_node != RoguelikeMap::INIT_INDEX) {
+                path_so_far.emplace_back("n" + std::to_string(curr_node));
+            }
+            ctx["planned_path_so_far"] = std::move(path_so_far);
+
+            json::array nodes;
+            for (size_t node = RoguelikeMap::INIT_INDEX + 1; node < m_map.size(); ++node) {
+                const size_t column = m_map.get_node_column(node);
+                const int column_delta = static_cast<int>(column) - static_cast<int>(m_selected_column);
+                const int node_x = m_selected_x + column_delta * m_column_offset;
+                const int node_y = m_map.get_node_y(node);
+                const RoguelikeNodeType node_type = m_map.get_node_type(node);
+
+                json::value item;
+                item["id"] = "n" + std::to_string(node);
+                item["type"] = vlm_node_type(node_type);
+                item["name"] = type2name(node_type);
+                item["raw_type"] = type2name(node_type);
+                item["depth_from_start"] = static_cast<int>(column);
+                item["reachable_now"] = reachable_set.contains(node);
+                json::array click_point;
+                click_point.emplace_back(node_x + m_node_width / 2);
+                click_point.emplace_back(node_y + m_node_height / 2);
+                item["click_point"] = std::move(click_point);
+                nodes.emplace_back(std::move(item));
+            }
+            ctx["all_nodes_in_floor"] = std::move(nodes);
+
+            auto resp = vlm->request_decision("/decide/map_node", ctrler()->get_image(), ctx);
+            if (resp && resp->is_object()) {
+                const auto& obj = resp->as_object();
+                auto action = obj.find("action");
+                auto node_id = obj.find("node_id");
+                if (action && action->is_string() && action->as_string() == "goto" && node_id &&
+                    node_id->is_string()) {
+                    for (size_t node : reachable_nodes) {
+                        if (node_id->as_string() == "n" + std::to_string(node)) {
+                            next_node = node;
+                            vlm_chosen = true;
+                            Log.info(
+                                __FUNCTION__,
+                                "| VLM map node pick:",
+                                node_id->as_string(),
+                                type2name(m_map.get_node_type(node)));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!vlm_chosen && m_map.get_node_cost(next_node) >= 1000) {
         Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-ExitThenAbandon");
         reset_in_run_variables();
         return;
@@ -563,11 +699,29 @@ void asst::RoguelikeRoutingTaskPlugin::navigate_route()
     ctrler()->click(next_node_center);
     sleep(200);
 
-    if (m_map.get_node_type(next_node) == RoguelikeNodeType::Encounter) {
+    const RoguelikeNodeType next_node_type = m_map.get_node_type(next_node);
+    if (m_config->get_mode() == RoguelikeMode::VLMAgent) {
+        const std::string action = sarkaz_routing_action_for_node(next_node_type);
+        if (!action.empty()) {
+            Task.set_task_base("RoguelikeRoutingAction", action);
+            m_map.set_curr_pos(next_node);
+        }
+        else {
+            Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-ExitThenAbandon");
+            reset_in_run_variables();
+        }
+
+        if (next_node_type == RoguelikeNodeType::RogueTrader) {
+            reset_in_run_variables();
+        }
+        return;
+    }
+
+    if (next_node_type == RoguelikeNodeType::Encounter) {
         Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-StageEncounterEnter");
         m_map.set_curr_pos(next_node);
     }
-    else if (m_map.get_node_type(next_node) == RoguelikeNodeType::RogueTrader) {
+    else if (next_node_type == RoguelikeNodeType::RogueTrader) {
         Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-StageTraderEnter");
         reset_in_run_variables();
     }

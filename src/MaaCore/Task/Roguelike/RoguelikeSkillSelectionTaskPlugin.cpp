@@ -3,6 +3,7 @@
 #include "Config/Roguelike/RoguelikeRecruitConfig.h"
 #include "Config/TaskData.h"
 #include "Controller/Controller.h"
+#include "Task/Roguelike/VLMAgent/RoguelikeVLMAgentPlugin.h"
 #include "Utils/Logger.hpp"
 #include "Vision/Roguelike/RoguelikeSkillSelectionImageAnalyzer.h"
 
@@ -50,12 +51,49 @@ bool asst::RoguelikeSkillSelectionTaskPlugin::_run()
             continue;
         }
 
-        if (oper_info.alternate_skill > 0) {
+        bool vlm_handled = false;
+        if (m_config->get_mode() == RoguelikeMode::VLMAgent) {
+            if (auto vlm = m_config->get_vlm_agent(); vlm && vlm->enabled() && !vlm->session_id().empty()) {
+                json::value ctx;
+                ctx["operator"] = name;
+                ctx["occasion"] = "pre_battle";
+                ctx["current_roster_summary"] = vlm->current_roster_summary();
+
+                json::array skills;
+                for (size_t index = 0; index < skill_vec.size(); ++index) {
+                    json::value skill;
+                    skill["index"] = static_cast<int>(index) + 1;
+                    skill["name_ocr"] = "";
+                    skill["desc_ocr"] = "";
+                    skills.emplace_back(std::move(skill));
+                }
+                ctx["skills"] = std::move(skills);
+
+                auto resp = vlm->request_decision("/decide/skill_selection", image, ctx);
+                if (resp && resp->is_object()) {
+                    const auto& obj = resp->as_object();
+                    auto action = obj.find("action");
+                    auto skill_index = obj.find("skill_index");
+                    if (action && action->is_string() && action->as_string() == "pick" && skill_index &&
+                        skill_index->is_number()) {
+                        const int index = skill_index->as_integer();
+                        if (index >= 1 && static_cast<size_t>(index) <= skill_vec.size()) {
+                            Log.info(__FUNCTION__, name, " VLM select skill:", index);
+                            ctrler()->click(skill_vec.at(index - 1));
+                            sleep(delay);
+                            vlm_handled = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!vlm_handled && oper_info.alternate_skill > 0) {
             Log.info(__FUNCTION__, name, " select alternate skill:", oper_info.alternate_skill);
             ctrler()->click(skill_vec.at(oper_info.alternate_skill - 1));
             sleep(delay);
         }
-        if (oper_info.skill > 0) {
+        if (!vlm_handled && oper_info.skill > 0) {
             Log.info(__FUNCTION__, name, " select main skill:", oper_info.skill);
             ctrler()->click(skill_vec.at(oper_info.skill - 1));
             sleep(delay);

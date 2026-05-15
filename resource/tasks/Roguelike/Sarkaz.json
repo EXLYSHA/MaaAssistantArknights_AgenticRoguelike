@@ -1158,6 +1158,19 @@
             ["诡.*断章", "_exit"]
         ]
     },
+    "Sarkaz@Roguelike@StrategyChange_mode30001": {
+        "baseTask": "Sarkaz@Roguelike@StrategyChange_mode0",
+        "text": ["_routing", "_default", "_SKIP_"],
+        "ocrReplace": [
+            ["熔魂之始", "_routing"],
+            ["锻铁根须", "_default"],
+            ["灰铸迷城", "_default"],
+            ["或然歧域", "_default"],
+            ["虚实疆界", "_default"],
+            ["辉光天顶", "_default"],
+            ["诡.*断章", "_SKIP_"]
+        ]
+    },
     "Sarkaz@Roguelike@StrategyChange_mode4": {
         "text": ["_default", "_exit"],
         "ocrReplace": [

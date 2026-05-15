@@ -4,8 +4,25 @@
 #include "Config/TaskData.h"
 #include "Controller/Controller.h"
 #include "Task/ProcessTask.h"
+#include "Task/Roguelike/VLMAgent/RoguelikeVLMAgentPlugin.h"
 #include "Utils/Logger.hpp"
 #include <ranges>
+
+namespace
+{
+json::array make_vlm_group_array(const std::string& theme, const std::string& name)
+{
+    json::array groups;
+    const auto group_ids = asst::RoguelikeRecruit.get_group_ids_of_oper(theme, name);
+    for (int id : group_ids) {
+        std::string group_name = asst::RoguelikeRecruit.get_group_name_from_id(theme, id);
+        if (!group_name.empty()) {
+            groups.emplace_back(std::move(group_name));
+        }
+    }
+    return groups;
+}
+} // namespace
 
 bool asst::RoguelikeFormationTaskPlugin::verify(AsstMsg msg, const json::value& details) const
 {
@@ -38,6 +55,11 @@ bool asst::RoguelikeFormationTaskPlugin::_run()
     RoguelikeFormationImageAnalyzer formation_analyzer(ctrler()->get_image());
     if (!formation_analyzer.analyze()) {
         return false;
+    }
+
+    if (m_config->get_mode() == RoguelikeMode::VLMAgent) {
+        clear_and_reselect();
+        return true;
     }
 
     size_t pre_selected = 0;
@@ -106,6 +128,64 @@ void asst::RoguelikeFormationTaskPlugin::clear_and_reselect()
     }
 
     Log.info(__FUNCTION__, "max_page: ", max_page, " oper_count: ", oper_list.size());
+
+    if (m_config->get_mode() == RoguelikeMode::VLMAgent && !oper_list.empty()) {
+        if (auto vlm = m_config->get_vlm_agent(); vlm && vlm->enabled() && !vlm->session_id().empty()) {
+            json::value ctx;
+            ctx["stage_name"] = "";
+            ctx["formation_limit"] = m_config->status().formation_upper_limit;
+            ctx["stage_required_groups"] = json::array {};
+
+            json::array roster;
+            for (const auto& oper : oper_list) {
+                json::value item;
+                item["name"] = oper.name;
+                if (auto iter = m_config->status().opers.find(oper.name); iter != m_config->status().opers.end()) {
+                    item["elite"] = iter->second.elite;
+                    item["level"] = iter->second.level;
+                }
+                else {
+                    item["elite"] = 0;
+                    item["level"] = 0;
+                }
+                item["groups"] = make_vlm_group_array(m_config->get_theme(), oper.name);
+                roster.emplace_back(std::move(item));
+            }
+            ctx["full_roster"] = std::move(roster);
+
+            auto resp = vlm->request_decision("/decide/pre_battle_team", ctrler()->get_image(), ctx);
+            if (resp && resp->is_object()) {
+                const auto& obj = resp->as_object();
+                auto action = obj.find("action");
+                auto selected = obj.find("selected");
+                if (action && action->is_string() && action->as_string() == "form" && selected &&
+                    selected->is_array()) {
+                    std::unordered_set<std::string> already_selected;
+                    for (const auto& selected_json : selected->as_array()) {
+                        if (!selected_json.is_string()) {
+                            continue;
+                        }
+                        const std::string& name = selected_json.as_string();
+                        if (already_selected.contains(name)) {
+                            continue;
+                        }
+                        auto iter = std::ranges::find_if(oper_list, [&](const auto& oper) {
+                            return oper.name == name;
+                        });
+                        if (iter == oper_list.end()) {
+                            continue;
+                        }
+                        Log.info(__FUNCTION__, "VLM select oper", name);
+                        select(*iter);
+                        already_selected.emplace(name);
+                    }
+                    if (!already_selected.empty()) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 
     std::vector<asst::RoguelikeFormationImageAnalyzer::FormationOper> sorted_oper_list;
     std::unordered_set<std::string> oper_to_select; // 和上面的 vector 一致，用于快速查重

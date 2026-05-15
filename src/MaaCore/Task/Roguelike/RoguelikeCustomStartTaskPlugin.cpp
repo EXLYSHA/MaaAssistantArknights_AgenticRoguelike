@@ -1,13 +1,86 @@
 #include "RoguelikeCustomStartTaskPlugin.h"
 
+#include <array>
+#include <unordered_set>
+
 #include "Config/GeneralConfig.h"
 #include "Config/Miscellaneous/BattleDataConfig.h"
 #include "Config/TaskData.h"
 #include "Controller/Controller.h"
 #include "Task/ProcessTask.h"
+#include "Task/Roguelike/VLMAgent/RoguelikeVLMAgentPlugin.h"
 #include "Utils/Logger.hpp"
 #include "Vision/Miscellaneous/PipelineAnalyzer.h"
 #include "Vision/OCRer.h"
+
+namespace
+{
+std::string normalize_squad_ocr_text(const std::string& text)
+{
+    std::string normalized;
+    normalized.reserve(text.size());
+    for (char ch : text) {
+        if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') {
+            normalized.push_back(ch);
+        }
+    }
+    return normalized;
+}
+
+bool is_squad_title(const std::string& text)
+{
+    static const std::string SquadSuffix = "分队";
+    if (text.size() < SquadSuffix.size() || text.size() > 30) {
+        return false;
+    }
+    return text.compare(text.size() - SquadSuffix.size(), SquadSuffix.size(), SquadSuffix) == 0;
+}
+
+bool is_unlock_marker(const std::string& text)
+{
+    return text.find("解锁") != std::string::npos || text.find("解鎖") != std::string::npos ||
+           text.find("锁条件") != std::string::npos || text.find("鎖條件") != std::string::npos;
+}
+
+int center_x(const asst::Rect& rect)
+{
+    return rect.x + rect.width / 2;
+}
+
+bool same_squad_card(const asst::TextRect& title, const asst::TextRect& unlock_marker)
+{
+    int dx = center_x(title.rect) - center_x(unlock_marker.rect);
+    if (dx < 0) {
+        dx = -dx;
+    }
+    const int dy = unlock_marker.rect.y - title.rect.y;
+    return dx < 170 && dy > 0 && dy < 90;
+}
+
+asst::Point visual_squad_slot_point(int slot_index)
+{
+    static constexpr std::array<int, 4> SlotCenterX = { 170, 455, 740, 1025 };
+    return { SlotCenterX.at(static_cast<size_t>(slot_index)), 445 };
+}
+
+json::array make_visual_squad_slots(size_t screenshot_count)
+{
+    json::array slots;
+    for (size_t screenshot_index = 0; screenshot_index != screenshot_count; ++screenshot_index) {
+        for (int slot_index = 0; slot_index != 4; ++slot_index) {
+            const asst::Point p = visual_squad_slot_point(slot_index);
+            json::value item;
+            item["id"] = "shot_" + std::to_string(screenshot_index) + "_slot_" + std::to_string(slot_index);
+            item["screenshot_index"] = static_cast<int>(screenshot_index);
+            item["slot_index"] = slot_index;
+            item["position"] = "该截图从左到右第 " + std::to_string(slot_index + 1) + " 张完整卡片";
+            item["click_point"] = json::array { p.x, p.y };
+            slots.emplace_back(std::move(item));
+        }
+    }
+    return slots;
+}
+} // namespace
 
 bool asst::RoguelikeCustomStartTaskPlugin::verify(AsstMsg msg, const json::value& details) const
 {
@@ -129,6 +202,142 @@ bool asst::RoguelikeCustomStartTaskPlugin::_run()
 bool asst::RoguelikeCustomStartTaskPlugin::hijack_squad()
 {
     std::string squad = !m_config->get_run_for_collectible() ? m_squad : m_collectible_mode_squad;
+    if (m_config->get_mode() == RoguelikeMode::VLMAgent) {
+        if (auto vlm = m_config->get_vlm_agent(); vlm && vlm->enabled() && !vlm->session_id().empty()) {
+            std::vector<cv::Mat> screenshots;
+            std::vector<std::string> available_squads;
+            std::vector<std::string> locked_squads;
+            std::unordered_set<std::string> seen_squads;
+            std::unordered_set<std::string> seen_locked_squads;
+
+            constexpr size_t SwipeTimes = 7;
+            for (size_t i = 0; i != SwipeTimes; ++i) {
+                if (need_exit()) {
+                    return false;
+                }
+                auto image = ctrler()->get_image();
+                screenshots.emplace_back(image.clone());
+                OCRer analyzer(image);
+                analyzer.set_task_info("RoguelikeCustom-HijackSquad");
+                if (analyzer.analyze()) {
+                    const auto& results = analyzer.get_result();
+                    std::vector<TextRect> unlock_markers;
+                    for (const auto& result : results) {
+                        const std::string text = normalize_squad_ocr_text(result.text);
+                        if (is_unlock_marker(text)) {
+                            unlock_markers.emplace_back(result);
+                        }
+                    }
+
+                    for (const auto& result : analyzer.get_result()) {
+                        std::string text = normalize_squad_ocr_text(result.text);
+                        if (!is_squad_title(text)) {
+                            continue;
+                        }
+
+                        bool locked = false;
+                        for (const auto& marker : unlock_markers) {
+                            if (same_squad_card(result, marker)) {
+                                locked = true;
+                                break;
+                            }
+                        }
+
+                        if (locked) {
+                            if (!seen_locked_squads.contains(text)) {
+                                seen_locked_squads.emplace(text);
+                                locked_squads.emplace_back(text);
+                            }
+                            continue;
+                        }
+
+                        if (!seen_squads.contains(text)) {
+                            seen_squads.emplace(text);
+                            available_squads.emplace_back(text);
+                        }
+                    }
+                }
+                ProcessTask(*this, { "Roguelike@SquadSlowlySwipeToTheRight" }).run();
+                sleep(Task.get("RoguelikeCustom-HijackSquad")->post_delay);
+            }
+            ProcessTask(*this, { "SwipeToTheLeft" }).run();
+
+            if (!screenshots.empty()) {
+                json::value ctx;
+                ctx["selection_mode"] = "visual_slots";
+                ctx["screenshot_count"] = static_cast<int>(screenshots.size());
+                ctx["slots_per_screenshot"] = 4;
+                ctx["visual_slots"] = make_visual_squad_slots(screenshots.size());
+
+                json::array squads;
+                for (const auto& name : available_squads) {
+                    squads.emplace_back(name);
+                }
+                ctx["available_squads"] = std::move(squads);
+                if (!locked_squads.empty()) {
+                    json::array locked;
+                    for (const auto& name : locked_squads) {
+                        locked.emplace_back(name);
+                    }
+                    ctx["locked_squads"] = std::move(locked);
+                }
+                ctx["user_hint"] = squad;
+                ctx["instruction"] =
+                    "OCR 只作为辅助。请看截图序列，选择一个没有锁图标、没有解锁条件的完整分队卡片，"
+                    "返回对应 screenshot_index 和 slot_index。";
+
+                auto resp = vlm->request_decision("/decide/squad", screenshots, ctx);
+                if (resp && resp->is_object()) {
+                    const auto& obj = resp->as_object();
+                    auto action = obj.find("action");
+                    auto squad_name = obj.find("squad_name");
+                    auto screenshot_index = obj.find("screenshot_index");
+                    auto slot_index = obj.find("slot_index");
+
+                    if (action && action->is_string() && action->as_string() == "pick" && screenshot_index &&
+                        screenshot_index->is_number() && slot_index && slot_index->is_number()) {
+                        const int screenshot_index_value = screenshot_index->as_integer();
+                        const int slot_index_value = slot_index->as_integer();
+                        if (screenshot_index_value >= 0 &&
+                            static_cast<size_t>(screenshot_index_value) < screenshots.size() && slot_index_value >= 0 &&
+                            slot_index_value < 4) {
+                            for (size_t i = 0; i != SwipeTimes; ++i) {
+                                ProcessTask(*this, { "SwipeToTheLeft" }).run();
+                            }
+                            for (int i = 0; i != screenshot_index_value; ++i) {
+                                ProcessTask(*this, { "Roguelike@SquadSlowlySwipeToTheRight" }).run();
+                                sleep(Task.get("RoguelikeCustom-HijackSquad")->post_delay);
+                            }
+                            const Point click_point = visual_squad_slot_point(slot_index_value);
+                            Log.info(
+                                __FUNCTION__,
+                                "| VLM squad visual pick:",
+                                "screenshot",
+                                screenshot_index_value,
+                                "slot",
+                                slot_index_value,
+                                "point",
+                                click_point.to_string(),
+                                "name",
+                                squad_name && squad_name->is_string() ? squad_name->as_string() : "");
+                            ctrler()->click(click_point);
+                            if (squad_name && squad_name->is_string()) {
+                                m_config->set_squad(squad_name->as_string());
+                            }
+                            return true;
+                        }
+                    }
+
+                    if (action && action->is_string() && action->as_string() == "pick" && squad_name &&
+                        squad_name->is_string() && seen_squads.contains(squad_name->as_string())) {
+                        squad = squad_name->as_string();
+                        Log.info(__FUNCTION__, "| VLM squad pick:", squad);
+                    }
+                }
+            }
+        }
+    }
+
     if (squad.empty()) { // 简单处理，认为指挥分队无需滑屏，没有就随机
         return ProcessTask(
                    *this,

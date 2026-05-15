@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <memory>
 #include <meojson/json.hpp>
 #include <optional>
 #include <string>
@@ -9,6 +10,8 @@
 
 namespace asst
 {
+class RoguelikeVLMAgentPlugin;
+
 class RoguelikeTheme
 {
 public:
@@ -37,7 +40,10 @@ enum class RoguelikeMode
     FastPass = 10001, // 10001 - 快速通过第一层
 
     // ------------------ 界园主题专用模式 ------------------
-    FindPlaytime = 20001 // 20001 - 刷常乐节点，第一层进洞，找不到需要的节点就重开
+    FindPlaytime = 20001, // 20001 - 刷常乐节点，第一层进洞，找不到需要的节点就重开
+
+    // ------------------ 实验：VLM Agent 模式 ------------------
+    VLMAgent = 30001 // 30001 - 用外部 VLM agent 接管决策类操作，仅 Sarkaz 主题生效
 };
 
 struct RoguelikeOper
@@ -96,7 +102,8 @@ public:
                mode == RoguelikeMode::Squad || mode == RoguelikeMode::Exploration ||
                (mode == RoguelikeMode::CLP_PDS && theme == RoguelikeTheme::Sami) ||
                (mode == RoguelikeMode::FastPass && theme == RoguelikeTheme::Sarkaz) ||
-               (mode == RoguelikeMode::FindPlaytime && theme == RoguelikeTheme::JieGarden);
+               (mode == RoguelikeMode::FindPlaytime && theme == RoguelikeTheme::JieGarden) ||
+               (mode == RoguelikeMode::VLMAgent && theme == RoguelikeTheme::Sarkaz);
     }
 
     bool verify_and_load_params(const json::value& params);
@@ -146,6 +153,11 @@ public:
     void set_find_playTime_target(int target) { m_find_playTime_target = target; }
 
     int get_find_playTime_target() const { return m_find_playTime_target; }
+
+    // ------------------ VLM Agent 共享句柄 ------------------
+    void set_vlm_agent(const std::weak_ptr<RoguelikeVLMAgentPlugin>& p) { m_vlm_agent = p; }
+
+    std::shared_ptr<RoguelikeVLMAgentPlugin> get_vlm_agent() const { return m_vlm_agent.lock(); }
 
 private:
     std::string m_theme;                       // 主题
@@ -201,6 +213,8 @@ public:
 
 private:
     RoguelikeStatus m_status; // 局内状态
+
+    std::weak_ptr<RoguelikeVLMAgentPlugin> m_vlm_agent; // VLM agent 插件句柄（可空）
 
     // ------------------ 开局 ------------------
     std::string m_core_char;              // 开局干员名

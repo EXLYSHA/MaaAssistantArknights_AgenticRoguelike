@@ -4,6 +4,7 @@
 #include "Config/TaskData.h"
 #include "Controller/Controller.h"
 #include "Task/ProcessTask.h"
+#include "Task/Roguelike/VLMAgent/RoguelikeVLMAgentPlugin.h"
 #include "Utils/Logger.hpp"
 #include "Vision/Matcher.h"
 #include "Vision/OCRer.h"
@@ -11,6 +12,65 @@
 #include "Vision/Roguelike/RoguelikeRecruitSupportAnalyzer.h"
 
 using namespace asst::battle::roguelike;
+
+namespace
+{
+std::vector<std::string> get_vlm_groups(const std::string& theme, const std::string& name)
+{
+    std::vector<std::string> groups;
+    const auto group_ids = asst::RoguelikeRecruit.get_group_ids_of_oper(theme, name);
+    for (int id : group_ids) {
+        std::string group_name = asst::RoguelikeRecruit.get_group_name_from_id(theme, id);
+        if (!group_name.empty()) {
+            groups.emplace_back(std::move(group_name));
+        }
+    }
+    return groups;
+}
+
+json::array make_roster_context_with_groups(asst::RoguelikeConfig& config)
+{
+    json::array roster;
+    for (const auto& [name, oper] : config.status().opers) {
+        json::value item;
+        item["name"] = name;
+        item["elite"] = oper.elite;
+        item["level"] = oper.level;
+        json::array groups;
+        for (const auto& group : get_vlm_groups(config.get_theme(), name)) {
+            groups.emplace_back(group);
+        }
+        item["groups"] = std::move(groups);
+        roster.emplace_back(std::move(item));
+    }
+    return roster;
+}
+
+json::value make_remaining_group_needs(
+    const std::string& theme,
+    const std::unordered_map<std::string, asst::RoguelikeOper>& chars_map)
+{
+    json::value needs = json::object {};
+    for (const auto& condition : asst::RoguelikeRecruit.get_team_complete_info(theme)) {
+        int matched = 0;
+        for (const auto& [name, oper] : chars_map) {
+            (void)oper;
+            if (condition.opers.contains(name)) {
+                ++matched;
+            }
+        }
+        const int deficit = condition.threshold - matched;
+        if (deficit <= 0) {
+            continue;
+        }
+        for (const std::string& group : condition.groups) {
+            const int current = needs.find<int>(group).value_or(0);
+            needs[group] = std::max(current, deficit);
+        }
+    }
+    return needs;
+}
+} // namespace
 
 bool asst::RoguelikeRecruitTaskPlugin::verify(AsstMsg msg, const json::value& details) const
 {
@@ -203,6 +263,9 @@ bool asst::RoguelikeRecruitTaskPlugin::_run()
 
     // 候选干员
     std::vector<RoguelikeRecruitInfo> recruit_list;
+    std::vector<RoguelikeRecruitInfo> vlm_candidates;
+    std::unordered_set<std::string> vlm_candidate_names;
+    std::vector<cv::Mat> vlm_page_images;
 
     // 干员名字的识别位置
     std::unordered_map<std::string, Rect> last_oper_rects;
@@ -237,6 +300,7 @@ bool asst::RoguelikeRecruitTaskPlugin::_run()
             // 已经滑动过，识别失败可能是干员不可选
             break;
         }
+        vlm_page_images.emplace_back(image.clone());
 
         std::unordered_set<std::string> oper_names;
         const auto& oper_list = analyzer.get_result();
@@ -388,6 +452,19 @@ bool asst::RoguelikeRecruitTaskPlugin::_run()
                 }
             }
 
+            if (!vlm_candidate_names.contains(recruit_info.name)) {
+                RoguelikeRecruitInfo info;
+                info.name = recruit_info.name;
+                info.priority = priority;
+                info.is_alternate = recruit_info.is_alternate;
+                info.page_index = i;
+                info.elite = oper_info.elite;
+                info.level = oper_info.level;
+                info.groups = get_vlm_groups(m_config->get_theme(), recruit_info.name);
+                vlm_candidates.emplace_back(std::move(info));
+                vlm_candidate_names.emplace(recruit_info.name);
+            }
+
             // 优先级为0，可能练度不够被忽略
             if (priority <= 0) {
                 continue;
@@ -403,6 +480,9 @@ bool asst::RoguelikeRecruitTaskPlugin::_run()
                 info.priority = priority;
                 info.is_alternate = recruit_info.is_alternate;
                 info.page_index = i;
+                info.elite = oper_info.elite;
+                info.level = oper_info.level;
+                info.groups = get_vlm_groups(m_config->get_theme(), recruit_info.name);
                 recruit_list.emplace_back(info);
             }
             Log.info(__FUNCTION__, "| Operator", recruit_info.name, "priority:", priority);
@@ -430,6 +510,76 @@ bool asst::RoguelikeRecruitTaskPlugin::_run()
         Log.trace(__FUNCTION__, "| Page", i, "oper count:", oper_count, "- continue swiping");
         slowly_swipe(false, max_oper_x - 200);
         sleep(Task.get("RoguelikeCustom-HijackCoChar")->post_delay);
+    }
+
+    if (m_config->get_mode() == RoguelikeMode::VLMAgent && !vlm_candidates.empty() && !vlm_page_images.empty()) {
+        if (auto vlm = m_config->get_vlm_agent(); vlm && vlm->enabled() && !vlm->session_id().empty()) {
+            json::value ctx;
+            ctx["floor"] = m_config->status().floor;
+            ctx["hope"] = m_config->status().hope;
+            ctx["is_start_recruit"] = m_initail_recruit;
+            ctx["current_roster"] = make_roster_context_with_groups(*m_config);
+            ctx["remaining_group_needs"] = make_remaining_group_needs(m_config->get_theme(), chars_map);
+
+            json::array candidates;
+            for (size_t index = 0; index < vlm_candidates.size(); ++index) {
+                const auto& candidate = vlm_candidates[index];
+                json::value item;
+                item["index"] = static_cast<int>(index);
+                item["name"] = candidate.name;
+                item["elite"] = candidate.elite;
+                item["level"] = candidate.level;
+                item["maa_priority"] = candidate.priority;
+                item["page_index"] = candidate.page_index;
+                json::array groups;
+                for (const auto& group : candidate.groups) {
+                    groups.emplace_back(group);
+                }
+                item["groups"] = std::move(groups);
+                candidates.emplace_back(std::move(item));
+            }
+            ctx["candidates"] = std::move(candidates);
+
+            auto resp = vlm->request_decision("/decide/recruit", vlm_page_images, ctx);
+            if (resp && resp->is_object()) {
+                const auto& obj = resp->as_object();
+                auto action = obj.find("action");
+                if (action && action->is_string()) {
+                    if (action->as_string() == "skip" || action->as_string() == "refresh") {
+                        Log.info(__FUNCTION__, "| VLM recruit decision:", action->as_string());
+                        return true;
+                    }
+                    auto pick_index = obj.find("pick_index");
+                    if (action->as_string() == "pick" && pick_index && pick_index->is_number()) {
+                        const int index = pick_index->as_integer();
+                        if (index >= 0 && static_cast<size_t>(index) < vlm_candidates.size()) {
+                            const auto& selected = vlm_candidates[index];
+                            Log.info(
+                                __FUNCTION__,
+                                "| VLM recruit pick:",
+                                selected.name,
+                                "index",
+                                index,
+                                "priority",
+                                selected.priority,
+                                "page",
+                                selected.page_index,
+                                "/",
+                                i);
+
+                            bool is_rtl = false;
+                            if (i != 0) {
+                                is_rtl = (selected.page_index * 2) >= i;
+                                if (!is_rtl) {
+                                    swipe_to_the_left_of_operlist(i + 1);
+                                }
+                            }
+                            return recruit_appointed_char(selected.name, is_rtl);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     bool recruited = false;

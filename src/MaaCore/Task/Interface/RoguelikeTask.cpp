@@ -43,6 +43,9 @@
 // ------------------ 界园主题专用配置及插件 ------------------
 #include "Task/Roguelike/JieGarden/RoguelikeCoppersTaskPlugin.h"
 
+// ------------------ VLM Agent 实验插件 ------------------
+#include "Task/Roguelike/VLMAgent/RoguelikeVLMAgentPlugin.h"
+
 #include "Utils/Logger.hpp"
 
 asst::RoguelikeTask::RoguelikeTask(const AsstCallback& callback, Assistant* inst) :
@@ -109,6 +112,12 @@ asst::RoguelikeTask::RoguelikeTask(const AsstCallback& callback, Assistant* inst
 
     // ------------------ 界园主题专用插件 ------------------
     m_roguelike_task_ptr->register_plugin<RoguelikeCoppersTaskPlugin>(m_config_ptr, m_control_ptr);
+
+    // ------------------ VLM Agent ------------------
+    // 必须最先注册：后续决策插件运行时会查询它的 session_id，
+    // 参见 RoguelikeStageEncounterTaskPlugin 等的 VLM 分支。
+    m_vlm_agent_ptr = m_roguelike_task_ptr->register_plugin<RoguelikeVLMAgentPlugin>(m_config_ptr, m_control_ptr);
+    m_config_ptr->set_vlm_agent(m_vlm_agent_ptr);
 
     m_subtasks.emplace_back(m_roguelike_task_ptr);
 }

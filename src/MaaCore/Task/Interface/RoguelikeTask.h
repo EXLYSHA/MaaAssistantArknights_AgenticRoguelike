@@ -11,6 +11,7 @@ class RoguelikeDebugTaskPlugin;
 class RoguelikeCustomStartTaskPlugin;
 class RoguelikeFoldartalStartTaskPlugin;
 class RoguelikeFoldartalUseTaskPlugin;
+class RoguelikeVLMAgentPlugin;
 
 class RoguelikeTask : public InterfaceTask
 {
@@ -31,5 +32,6 @@ private:
     std::shared_ptr<RoguelikeCustomStartTaskPlugin> m_custom_ptr = nullptr;
     std::shared_ptr<RoguelikeFoldartalStartTaskPlugin> m_foldartal_start_ptr = nullptr;
     std::shared_ptr<RoguelikeFoldartalUseTaskPlugin> m_foldartal_use_ptr = nullptr;
+    std::shared_ptr<RoguelikeVLMAgentPlugin> m_vlm_agent_ptr = nullptr;
 };
 }

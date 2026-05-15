@@ -7,6 +7,8 @@
 #include "MaaUtils/NoWarningCV.hpp"
 #include "Task/ProcessTask.h"
 #include "Task/Roguelike/Map/RoguelikeBoskyPassageMap.h"
+#include "Task/Roguelike/VLMAgent/RoguelikeVLMAgentPlugin.h"
+#include "Task/Roguelike/VLMAgent/VLMAgentClient.h"
 #include "Utils/DebugImageHelper.hpp"
 #include "Utils/Logger.hpp"
 #include "Vision/Matcher.h"
@@ -116,6 +118,52 @@ std::optional<std::string> asst::RoguelikeStageEncounterTaskPlugin::handle_singl
 
     size_t choose_option = process_task(event, special_val);
     Log.info("Event:", event.name, "special_val", special_val, "choose option", choose_option);
+
+    // ------------------ VLM Agent 决策覆盖 ------------------
+    if (m_config->get_mode() == RoguelikeMode::VLMAgent) {
+        if (auto vlm = m_config->get_vlm_agent(); vlm && vlm->enabled() && !vlm->session_id().empty()) {
+            std::vector<uchar> png_bytes;
+            if (cv::imencode(".png", image, png_bytes)) {
+                std::vector<VLMAgentClient::byte_t> bytes(png_bytes.begin(), png_bytes.end());
+                std::string b64 = VLMAgentClient::base64_encode(bytes);
+
+                json::value ctx;
+                ctx["floor"] = m_config->status().floor;
+                ctx["hope"] = m_config->status().hope;
+                ctx["hp"] = m_config->status().hp;
+                ctx["vision"] = special_val;
+                ctx["event_name_ocr"] = event.name;
+                json::array opts;
+                for (size_t i = 0; i < event.option_text.size(); ++i) opts.emplace_back(event.option_text[i]);
+                ctx["options_ocr"] = std::move(opts);
+                ctx["option_num"] = static_cast<int>(event.option_num);
+                json::array relics;
+                for (const auto& r : m_config->status().collections) relics.emplace_back(r);
+                ctx["current_relics"] = std::move(relics);
+
+                auto resp = vlm->client().request_decision("/decide/encounter", vlm->session_id(), { b64 }, ctx);
+                if (resp && resp->is_object()) {
+                    const auto& obj = resp->as_object();
+                    auto action = obj.find("action");
+                    auto idx = obj.find("option_index");
+                    if (action && action->is_string() && action->as_string() == "choose" && idx && idx->is_number()) {
+                        int vlm_idx = idx->as_integer();
+                        if (vlm_idx >= 0 && static_cast<size_t>(vlm_idx) < event.option_num) {
+                            Log.info(
+                                __FUNCTION__,
+                                std::format(
+                                    "| VLM override: event '{}' -> option {} (was {})",
+                                    event.name,
+                                    vlm_idx + 1,
+                                    choose_option));
+                            choose_option = static_cast<size_t>(vlm_idx) + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // ------------------ VLM Agent 决策覆盖 end ------------------
 
     auto info = basic_info_with_what("RoguelikeEvent");
     info["details"]["name"] = event.name;
