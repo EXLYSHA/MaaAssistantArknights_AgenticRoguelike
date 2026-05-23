@@ -46,13 +46,19 @@ class LevelRewardHandler(BaseHandler):
             if isinstance(opt, dict) and opt.get("kind") == "operator_recruit" and opt.get("name")
         ]
         current_relics = ctx.get("current_relics") or session.relics
+        relics_text = relic_brief(current_relics + option_relics) or "（PRTS 没找到这些藏品的资料，请凭名字推断）"
+        operators_text = operators_brief(option_operators, limit=4) or "（PRTS 没找到这些干员资料）"
         return (
             f"奖励类型: {ctx.get('reward_type')} 楼层 {ctx.get('floor')}\n"
             f"选项: {ctx.get('options')}\n"
             f"队伍: {ctx.get('current_roster_summary')} 藏品: {current_relics}\n"
-            f"相关藏品效果:\n{relic_brief(current_relics + option_relics) or '无'}\n"
-            f"可选干员 PRTS 摘要:\n{operators_brief(option_operators, limit=4) or '无'}\n"
-            "请选下标。"
+            f"PRTS 相关藏品效果（**必读**）:\n{relics_text}\n"
+            f"PRTS 可选干员摘要（**必读**）:\n{operators_text}\n"
+            "决策步骤：\n"
+            "1) 通读上面 PRTS 资料；\n"
+            "2) 在 reasoning 里**显式引用** PRTS 中关于你选择的那个选项的关键事实"
+            "（如藏品效果、干员核心机制），并解释为何选；\n"
+            "3) 返回 option_index。"
         )
 
     def update_session(self, session: Session, req: DecisionRequest, decision: dict) -> None:
@@ -87,6 +93,12 @@ class LevelRewardHandler(BaseHandler):
         }
         if valid_indices and decision.get("option_index") not in valid_indices:
             return self._fallback_decision(session, req, "奖励选项下标越界")
+        reasoning = str(decision.get("reasoning") or "")
+        if len(reasoning) < 30:
+            return self._fallback_decision(
+                session, req,
+                "奖励选择 reasoning 太短，必须基于 PRTS 解释为何选该选项（>=30 字符）",
+            )
         return decision
 
     def tool_schema(self) -> dict:

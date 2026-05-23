@@ -56,6 +56,7 @@ private:
         std::optional<std::reference_wrapper<cv::Mat>> image_draw_opt = std::nullopt);
     void refresh_following_combat_nodes();
     void navigate_route();
+    bool navigate_route_vlm_only();
     void update_selected_x();
 
     inline static std::function<std::string(RoguelikeNodeType)> type2name = &RoguelikeMapConfig::type2name;
@@ -79,5 +80,9 @@ private:
 
     // view-related
     int m_left_most_column_x_in_view = 0;
+
+    // VLM 选择节点后，缓存这一帧识别到的真实点击坐标，供后续 click 使用，
+    // 避免使用 m_map 缓存的过期坐标
+    std::optional<Point> m_vlm_next_click_override;
 };
 }

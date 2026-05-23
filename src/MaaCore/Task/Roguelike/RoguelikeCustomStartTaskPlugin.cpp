@@ -132,6 +132,10 @@ bool asst::RoguelikeCustomStartTaskPlugin::verify(AsstMsg msg, const json::value
     }
 
     // Roles CoreChar
+    if (m_waiting_to_run == RoguelikeCustomType::Roles && m_config->get_mode() == RoguelikeMode::VLMAgent) {
+        // VLM 模式下不需要预先配置 roles，进入 hijack_roles 由 VLM 决策招募组合
+        return true;
+    }
     if (auto it = m_customs.find(m_waiting_to_run); it == m_customs.cend()) {
         return false;
     }
@@ -404,6 +408,78 @@ bool asst::RoguelikeCustomStartTaskPlugin::hijack_reward()
 bool asst::RoguelikeCustomStartTaskPlugin::hijack_roles()
 {
     constexpr size_t SwipeTimes = 7;
+
+    if (m_config->get_mode() == RoguelikeMode::VLMAgent) {
+        if (auto vlm = m_config->get_vlm_agent(); vlm && vlm->enabled() && !vlm->session_id().empty()) {
+            // Roles 屏（招募组合：先手制胜/稳扎稳打/取长补短/随心所欲）所有卡片都在同一个画面，
+            // 单张截图即可，避免无意义的滑屏 + 重复传图。
+            cv::Mat image = ctrler()->get_image();
+
+            std::vector<std::string> ocr_roles;
+            std::unordered_set<std::string> seen;
+            OCRer ocr(image);
+            ocr.set_task_info("RoguelikeCustom-HijackRoles");
+            if (ocr.analyze()) {
+                for (const auto& r : ocr.get_result()) {
+                    const std::string text = normalize_squad_ocr_text(r.text);
+                    if (text.empty() || text.size() > 30) {
+                        continue;
+                    }
+                    if (!seen.contains(text)) {
+                        seen.emplace(text);
+                        ocr_roles.emplace_back(text);
+                    }
+                }
+            }
+
+            json::value ctx;
+            ctx["selection_mode"] = "visual_slots";
+            ctx["screenshot_count"] = 1;
+            ctx["slots_per_screenshot"] = 4;
+            ctx["visual_slots"] = make_visual_squad_slots(1);
+
+            json::array roles;
+            for (const auto& name : ocr_roles) {
+                roles.emplace_back(name);
+            }
+            ctx["ocr_candidates"] = std::move(roles);
+            ctx["squad"] = m_config->get_squad();
+            ctx["instruction"] =
+                "这是肉鸽开局的招募组合（也称为职业组/Roles）选择，整个界面一张截图就能看到全部 4 张卡片，"
+                "请结合视觉判断每个招募组合给出的偏向（如近战/远程/法术/治疗/盾兵/速攻等），"
+                "结合当前分队和你计划的过关路线，选择一个最合适的招募组合，"
+                "返回 screenshot_index=0 和对应 slot_index。";
+
+            auto resp = vlm->request_decision("/decide/recruit_combo", image, ctx);
+            if (resp && resp->is_object()) {
+                const auto& obj = resp->as_object();
+                auto action = obj.find("action");
+                auto slot_index = obj.find("slot_index");
+                auto combo_name = obj.find("combo_name");
+
+                if (action && action->is_string() && action->as_string() == "pick" && slot_index &&
+                    slot_index->is_number()) {
+                    const int slot = slot_index->as_integer();
+                    if (slot >= 0 && slot < 4) {
+                        const Point click_point = visual_squad_slot_point(slot);
+                        Log.info(
+                            __FUNCTION__,
+                            "| VLM recruit_combo visual pick: slot",
+                            slot,
+                            "point",
+                            click_point.to_string(),
+                            "name",
+                            combo_name && combo_name->is_string() ? combo_name->as_string() : "");
+                        ctrler()->click(click_point);
+                        return true;
+                    }
+                }
+            }
+            // VLM 失败，回退默认
+            return ProcessTask(*this, { "Roguelike@RolesDefault" }).run();
+        }
+    }
+
     const std::string& required_role = m_customs[RoguelikeCustomType::Roles];
 
     for (size_t i = 0; i != SwipeTimes; ++i) {

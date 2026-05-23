@@ -28,7 +28,7 @@ std::vector<std::string> get_vlm_groups(const std::string& theme, const std::str
     return groups;
 }
 
-json::array make_roster_context_with_groups(asst::RoguelikeConfig& config)
+json::array make_roster_context_plain(asst::RoguelikeConfig& config)
 {
     json::array roster;
     for (const auto& [name, oper] : config.status().opers) {
@@ -36,39 +36,9 @@ json::array make_roster_context_with_groups(asst::RoguelikeConfig& config)
         item["name"] = name;
         item["elite"] = oper.elite;
         item["level"] = oper.level;
-        json::array groups;
-        for (const auto& group : get_vlm_groups(config.get_theme(), name)) {
-            groups.emplace_back(group);
-        }
-        item["groups"] = std::move(groups);
         roster.emplace_back(std::move(item));
     }
     return roster;
-}
-
-json::value make_remaining_group_needs(
-    const std::string& theme,
-    const std::unordered_map<std::string, asst::RoguelikeOper>& chars_map)
-{
-    json::value needs = json::object {};
-    for (const auto& condition : asst::RoguelikeRecruit.get_team_complete_info(theme)) {
-        int matched = 0;
-        for (const auto& [name, oper] : chars_map) {
-            (void)oper;
-            if (condition.opers.contains(name)) {
-                ++matched;
-            }
-        }
-        const int deficit = condition.threshold - matched;
-        if (deficit <= 0) {
-            continue;
-        }
-        for (const std::string& group : condition.groups) {
-            const int current = needs.find<int>(group).value_or(0);
-            needs[group] = std::max(current, deficit);
-        }
-    }
-    return needs;
 }
 } // namespace
 
@@ -518,8 +488,7 @@ bool asst::RoguelikeRecruitTaskPlugin::_run()
             ctx["floor"] = m_config->status().floor;
             ctx["hope"] = m_config->status().hope;
             ctx["is_start_recruit"] = m_initail_recruit;
-            ctx["current_roster"] = make_roster_context_with_groups(*m_config);
-            ctx["remaining_group_needs"] = make_remaining_group_needs(m_config->get_theme(), chars_map);
+            ctx["current_roster"] = make_roster_context_plain(*m_config);
 
             json::array candidates;
             for (size_t index = 0; index < vlm_candidates.size(); ++index) {
@@ -529,13 +498,7 @@ bool asst::RoguelikeRecruitTaskPlugin::_run()
                 item["name"] = candidate.name;
                 item["elite"] = candidate.elite;
                 item["level"] = candidate.level;
-                item["maa_priority"] = candidate.priority;
                 item["page_index"] = candidate.page_index;
-                json::array groups;
-                for (const auto& group : candidate.groups) {
-                    groups.emplace_back(group);
-                }
-                item["groups"] = std::move(groups);
                 candidates.emplace_back(std::move(item));
             }
             ctx["candidates"] = std::move(candidates);

@@ -22,13 +22,19 @@ class SkillSelectionHandler(BaseHandler):
     def build_user_text(self, session: Session, req: DecisionRequest) -> str:
         ctx = req.context
         operator = str(ctx.get("operator") or "")
+        prts = operator_brief(operator) or "（PRTS 上没找到该干员资料，请直接看截图判断）"
         return (
             f"干员: {operator}\n"
             f"场景: {ctx.get('occasion')}\n"
             f"技能选项: {ctx.get('skills')}\n"
-            f"PRTS 干员知识:\n{operator_brief(operator) or '无'}\n"
+            f"PRTS 干员知识（必须先读再决策）:\n{prts}\n"
             f"当前队伍: {ctx.get('current_roster_summary')}\n"
-            "请挑技能编号 (1/2/3)。技能描述可能 OCR 不全，请直接看图。"
+            "决策步骤：\n"
+            "1) 通读上面 PRTS 资料里关于该干员各技能的描述与定位；\n"
+            "2) 在 reasoning 里**显式引用** PRTS 资料中至少一项你看到的关键事实"
+            "（如某技能的伤害类型、机制、推荐场景），并解释为何选这个技能；\n"
+            "3) 给出 skill_index (1/2/3)。\n"
+            "技能描述可能 OCR 不全，请同时结合截图。"
         )
 
     def repair_decision(self, session: Session, req: DecisionRequest, decision: dict) -> dict:
@@ -41,6 +47,12 @@ class SkillSelectionHandler(BaseHandler):
         } or {1, 2, 3}
         if decision.get("skill_index") not in available:
             return self._fallback_decision(session, req, "技能编号不在可选列表中")
+        reasoning = str(decision.get("reasoning") or "")
+        if len(reasoning) < 30:
+            return self._fallback_decision(
+                session, req,
+                "技能选择的 reasoning 太短，必须基于 PRTS 资料解释为何选该技能（>=30 字符）",
+            )
         return decision
 
     def tool_schema(self) -> dict:

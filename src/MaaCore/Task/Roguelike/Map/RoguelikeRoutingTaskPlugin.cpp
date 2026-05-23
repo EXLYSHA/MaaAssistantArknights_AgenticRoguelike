@@ -18,7 +18,7 @@
 
 namespace
 {
-std::string vlm_node_type(asst::RoguelikeNodeType type)
+[[maybe_unused]] std::string vlm_node_type(asst::RoguelikeNodeType type)
 {
     switch (type) {
     case asst::RoguelikeNodeType::CombatOps:
@@ -52,11 +52,11 @@ std::string sarkaz_routing_action_for_node(asst::RoguelikeNodeType type)
 {
     switch (type) {
     case asst::RoguelikeNodeType::CombatOps:
-        return "Sarkaz@Roguelike@StageCombatOpsEnter";
+        return "Sarkaz@RoguelikeRoutingAction-StageCombatOpsEnter";
     case asst::RoguelikeNodeType::EmergencyOps:
-        return "Sarkaz@Roguelike@StageEmergencyOpsEnter";
+        return "Sarkaz@RoguelikeRoutingAction-StageEmergencyOpsEnter";
     case asst::RoguelikeNodeType::DreadfulFoe:
-        return "Sarkaz@Roguelike@StageDreadfulFoeEnter";
+        return "Sarkaz@RoguelikeRoutingAction-StageDreadfulFoeEnter";
     case asst::RoguelikeNodeType::Encounter:
     case asst::RoguelikeNodeType::Recreation:
     case asst::RoguelikeNodeType::Scout:
@@ -64,15 +64,15 @@ std::string sarkaz_routing_action_for_node(asst::RoguelikeNodeType type)
     case asst::RoguelikeNodeType::FaceOff:
         return "Sarkaz@RoguelikeRoutingAction-StageEncounterEnter";
     case asst::RoguelikeNodeType::Boons:
-        return "Sarkaz@Roguelike@StageBoonsEnter";
+        return "Sarkaz@RoguelikeRoutingAction-StageBoonsEnter";
     case asst::RoguelikeNodeType::SafeHouse:
-        return "Sarkaz@Roguelike@StageSafeHouseEnter";
+        return "Sarkaz@RoguelikeRoutingAction-StageSafeHouseEnter";
     case asst::RoguelikeNodeType::RogueTrader:
         return "Sarkaz@RoguelikeRoutingAction-StageTraderEnter";
     case asst::RoguelikeNodeType::IdeaFilter:
-        return "Sarkaz@Roguelike@StageFilterTruthEnter";
+        return "Sarkaz@RoguelikeRoutingAction-StageFilterTruthEnter";
     case asst::RoguelikeNodeType::BoskyPassage:
-        return "Sarkaz@Roguelike@StageBoskyPassageEnter";
+        return "Sarkaz@RoguelikeRoutingAction-StageBoskyPassageEnter";
     default:
         return "";
     }
@@ -307,6 +307,10 @@ bool asst::RoguelikeRoutingTaskPlugin::_run()
         }
         break;
     case RoutingStrategy::Sarkaz_FastPass:
+        // VLM 模式下完全跳过 m_map 缓存逻辑，每次直接用当前画面识别可见节点交给 VLM。
+        if (m_config->get_mode() == RoguelikeMode::VLMAgent) {
+            return navigate_route_vlm_only();
+        }
         if (m_need_generate_map) {
             generate_map();
             m_need_generate_map = false;
@@ -623,15 +627,98 @@ void asst::RoguelikeRoutingTaskPlugin::navigate_route()
 
     if (m_config->get_mode() == RoguelikeMode::VLMAgent) {
         if (auto vlm = m_config->get_vlm_agent(); vlm && vlm->enabled() && !vlm->session_id().empty()) {
+            // 拍照前先点一下地图左上空白区，关掉可能残留的节点详情面板，避免遮挡 VLM 视野
+            ctrler()->click(Point(40, 360));
+            sleep(200);
+
+            // 用当前画面重新模板匹配，得到每个可见节点的真实屏幕坐标。
+            // m_map 里缓存的 y 与 m_selected_x 在每次进入节点后都可能失效。
+            // 注意 RoguelikeRoutingNodeAnalyze 任务的 ROI 只覆盖单列，必须扩到整图才能识别全部可见节点。
+            cv::Mat live_image = ctrler()->get_image();
+            std::unordered_map<size_t, Rect> live_rects;
+            {
+                MultiMatcher live_analyzer(live_image);
+                live_analyzer.set_task_info(m_config->get_theme() + "@RoguelikeRoutingNodeAnalyze");
+                live_analyzer.set_roi(Rect(0, 0, live_image.cols, live_image.rows));
+                if (live_analyzer.analyze()) {
+                    auto matches = live_analyzer.get_result();
+                    sort_by_vertical_(matches);
+                    Log.info(
+                        __FUNCTION__,
+                        "| VLM live match found",
+                        matches.size(),
+                        "node templates in screen");
+
+                    // 按列拆分（与 update_map 同样的逻辑：x 跨过 node_width 视为下一列）
+                    std::vector<std::vector<MultiMatcher::Result>> per_col;
+                    int curr_x = -m_node_width - 1;
+                    for (const auto& m : matches) {
+                        if (m.rect.x >= curr_x + m_node_width) {
+                            per_col.emplace_back();
+                            curr_x = m.rect.x;
+                        }
+                        per_col.back().push_back(m);
+                    }
+                    for (auto& col : per_col) {
+                        std::sort(col.begin(), col.end(),
+                                  [](const auto& a, const auto& b) { return a.rect.y < b.rect.y; });
+                    }
+
+                    // 把屏幕上每个 (列, 行) 对到 m_map 的 node index。
+                    // 找出 m_map 里"哪一列在屏幕最左"的方式：从当前节点列附近往左尝试。
+                    const size_t curr_col = m_map.get_node_column(m_map.get_curr_pos());
+                    Log.info(
+                        __FUNCTION__,
+                        "| live screen columns:",
+                        per_col.size(),
+                        "m_map columns:",
+                        m_map.get_num_columns(),
+                        "curr_col:",
+                        curr_col);
+                    for (size_t i = 0; i < per_col.size(); ++i) {
+                        Log.info(__FUNCTION__, "| screen col", i, "size", per_col[i].size(),
+                                 "x≈", per_col[i].empty() ? 0 : per_col[i][0].rect.x);
+                    }
+                    for (size_t col_off = 0; col_off + per_col.size() <= m_map.get_num_columns(); ++col_off) {
+                        // 尝试 m_map 列 [start, start + per_col.size()) 对齐屏幕列 [0, per_col.size())
+                        size_t start = col_off;
+                        bool ok = true;
+                        std::unordered_map<size_t, Rect> trial;
+                        for (size_t screen_col = 0; screen_col < per_col.size(); ++screen_col) {
+                            size_t mc = start + screen_col;
+                            size_t cb = m_map.get_column_begin(mc);
+                            size_t ce = m_map.get_column_end(mc);
+                            if (ce - cb != per_col[screen_col].size()) {
+                                ok = false;
+                                break;
+                            }
+                            for (size_t row = 0; row < per_col[screen_col].size(); ++row) {
+                                trial[cb + row] = per_col[screen_col][row].rect;
+                            }
+                        }
+                        if (ok && trial.count(m_map.get_curr_pos()) + (curr_col < start || curr_col >= start + per_col.size() ? 1 : 0) >= 1) {
+                            // 优先选择能覆盖当前节点附近的对齐方案
+                            live_rects = std::move(trial);
+                            break;
+                        }
+                        if (ok && live_rects.empty()) {
+                            live_rects = std::move(trial);
+                        }
+                    }
+                }
+            }
+
             const size_t curr_node = m_map.get_curr_pos();
             const auto reachable_nodes = m_map.get_node_succs(curr_node);
             std::unordered_set<size_t> reachable_set(reachable_nodes.begin(), reachable_nodes.end());
 
             json::value ctx;
-            ctx["floor"] = m_config->status().floor;
-            ctx["hope"] = m_config->status().hope;
-            ctx["hp"] = m_config->status().hp;
             ctx["current_roster_summary"] = vlm->current_roster_summary();
+            ctx["note"] =
+                "请直接看截图判断地图状态：左下角的图标读取 floor/hope/hp/思绪 等数值，"
+                "看节点图标确定关卡名/类型，看连线推断后继关系。"
+                "context 里给出的 click_point 是每个节点中心的屏幕坐标，仅用于把 nXX 与画面位置一一对应。"
+                "只允许从 reachable_node_ids 里选下一步，并自行考虑思绪/HP/费用等门槛节点是否能进。";
 
             json::array path_so_far;
             if (curr_node != RoguelikeMap::INIT_INDEX) {
@@ -640,29 +727,53 @@ void asst::RoguelikeRoutingTaskPlugin::navigate_route()
             ctx["planned_path_so_far"] = std::move(path_so_far);
 
             json::array nodes;
+            json::array reachable_options;
             for (size_t node = RoguelikeMap::INIT_INDEX + 1; node < m_map.size(); ++node) {
                 const size_t column = m_map.get_node_column(node);
-                const int column_delta = static_cast<int>(column) - static_cast<int>(m_selected_column);
-                const int node_x = m_selected_x + column_delta * m_column_offset;
-                const int node_y = m_map.get_node_y(node);
                 const RoguelikeNodeType node_type = m_map.get_node_type(node);
+                const bool reachable = reachable_set.contains(node);
+
+                int node_x = 0, node_y = 0;
+                bool visible = false;
+                if (auto it = live_rects.find(node); it != live_rects.end()) {
+                    node_x = it->second.x;
+                    node_y = it->second.y;
+                    visible = true;
+                }
+                else {
+                    // 不在当前屏幕上的兜底（理论上 reachable 节点必然可见）
+                    const int column_delta = static_cast<int>(column) - static_cast<int>(m_selected_column);
+                    node_x = m_selected_x + column_delta * m_column_offset;
+                    node_y = m_map.get_node_y(node);
+                }
 
                 json::value item;
                 item["id"] = "n" + std::to_string(node);
-                item["type"] = vlm_node_type(node_type);
-                item["name"] = type2name(node_type);
                 item["raw_type"] = type2name(node_type);
                 item["depth_from_start"] = static_cast<int>(column);
-                item["reachable_now"] = reachable_set.contains(node);
+                item["reachable_now"] = reachable;
+                item["visible_on_screen"] = visible;
                 json::array click_point;
                 click_point.emplace_back(node_x + m_node_width / 2);
                 click_point.emplace_back(node_y + m_node_height / 2);
                 item["click_point"] = std::move(click_point);
                 nodes.emplace_back(std::move(item));
+                if (reachable) {
+                    reachable_options.emplace_back("n" + std::to_string(node));
+                }
             }
             ctx["all_nodes_in_floor"] = std::move(nodes);
+            ctx["reachable_node_ids"] = std::move(reachable_options);
 
-            auto resp = vlm->request_decision("/decide/map_node", ctrler()->get_image(), ctx);
+            // 当前所在节点 id
+            if (curr_node == RoguelikeMap::INIT_INDEX) {
+                ctx["current_node_id"] = "start";
+            }
+            else {
+                ctx["current_node_id"] = "n" + std::to_string(curr_node);
+            }
+
+            auto resp = vlm->request_decision("/decide/map_node", live_image, ctx);
             if (resp && resp->is_object()) {
                 const auto& obj = resp->as_object();
                 auto action = obj.find("action");
@@ -673,11 +784,24 @@ void asst::RoguelikeRoutingTaskPlugin::navigate_route()
                         if (node_id->as_string() == "n" + std::to_string(node)) {
                             next_node = node;
                             vlm_chosen = true;
+                            // 把真实屏幕坐标存到成员变量，后面 click 时用真实坐标而不是 m_map 缓存
+                            if (auto it = live_rects.find(node); it != live_rects.end()) {
+                                m_vlm_next_click_override = Point(
+                                    it->second.x + m_node_width / 2,
+                                    it->second.y + m_node_height / 2);
+                            }
+                            else {
+                                m_vlm_next_click_override = std::nullopt;
+                            }
                             Log.info(
                                 __FUNCTION__,
                                 "| VLM map node pick:",
                                 node_id->as_string(),
-                                type2name(m_map.get_node_type(node)));
+                                type2name(m_map.get_node_type(node)),
+                                "click=",
+                                m_vlm_next_click_override
+                                    ? m_vlm_next_click_override->to_string()
+                                    : std::string("(cached)"));
                             break;
                         }
                     }
@@ -692,10 +816,17 @@ void asst::RoguelikeRoutingTaskPlugin::navigate_route()
         return;
     }
 
-    const size_t next_node_column = m_map.get_node_column(next_node);
-    const int next_node_x = m_selected_x + (next_node_column == m_selected_column ? 0 : m_column_offset);
-    const int next_node_y = m_map.get_node_y(next_node);
-    Point next_node_center = Point(next_node_x + m_node_width / 2, next_node_y + m_node_height / 2);
+    Point next_node_center;
+    if (vlm_chosen && m_vlm_next_click_override) {
+        next_node_center = *m_vlm_next_click_override;
+        m_vlm_next_click_override.reset();
+    }
+    else {
+        const size_t next_node_column = m_map.get_node_column(next_node);
+        const int next_node_x = m_selected_x + (next_node_column == m_selected_column ? 0 : m_column_offset);
+        const int next_node_y = m_map.get_node_y(next_node);
+        next_node_center = Point(next_node_x + m_node_width / 2, next_node_y + m_node_height / 2);
+    }
     ctrler()->click(next_node_center);
     sleep(200);
 
@@ -704,16 +835,14 @@ void asst::RoguelikeRoutingTaskPlugin::navigate_route()
         const std::string action = sarkaz_routing_action_for_node(next_node_type);
         if (!action.empty()) {
             Task.set_task_base("RoguelikeRoutingAction", action);
-            m_map.set_curr_pos(next_node);
         }
         else {
             Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-ExitThenAbandon");
-            reset_in_run_variables();
         }
-
-        if (next_node_type == RoguelikeNodeType::RogueTrader) {
-            reset_in_run_variables();
-        }
+        // VLM 模式下每次进完一个节点都让 m_map 重新生成，
+        // 因为玩家进入战斗/事件/商店后回来时一般会换新一层地图，
+        // 旧的 m_map 结构和坐标全部失效。
+        reset_in_run_variables();
         return;
     }
 
@@ -745,4 +874,244 @@ void asst::RoguelikeRoutingTaskPlugin::update_selected_x()
     else {
         m_selected_x = m_middle_x;
     }
+}
+
+bool asst::RoguelikeRoutingTaskPlugin::navigate_route_vlm_only()
+{
+    LogTraceFunction;
+
+    auto vlm = m_config->get_vlm_agent();
+    if (!vlm || !vlm->enabled() || vlm->session_id().empty()) {
+        Log.warn(__FUNCTION__, "| VLM agent not available, fallback abandon");
+        Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-ExitThenAbandon");
+        return true;
+    }
+
+    // 关掉残留的节点详情面板
+    ctrler()->click(Point(40, 360));
+    sleep(200);
+
+    cv::Mat live_image = ctrler()->get_image();
+
+    MultiMatcher analyzer(live_image);
+    analyzer.set_task_info(m_config->get_theme() + "@RoguelikeRoutingNodeAnalyze");
+    analyzer.set_roi(Rect(0, 0, live_image.cols, live_image.rows));
+    if (!analyzer.analyze()) {
+        Log.error(__FUNCTION__, "| no nodes detected on screen");
+        Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-ExitThenAbandon");
+        return true;
+    }
+
+    auto matches = analyzer.get_result();
+    sort_by_vertical_(matches);
+
+    // 节点是否"已访问/失效"的判定：模板名包含 "Grey"。
+    // 但有些节点类型（例如 RogueTrader）在资源里**只有** Grey 模板，
+    // 没有彩色版本——这种节点永远会被误判成 visited。所以先扫一遍所有匹配，
+    // 找出"两种版本都存在"的类型族，只有这些类型族 Grey == visited 才有效。
+    auto base_name = [](const std::string& templ) -> std::string {
+        // 去掉路径和扩展名，再去掉 "Grey" 后缀
+        std::string s = templ;
+        if (auto pos = s.find_last_of("/\\"); pos != std::string::npos) s = s.substr(pos + 1);
+        if (auto pos = s.rfind(".png"); pos != std::string::npos) s = s.substr(0, pos);
+        if (auto pos = s.rfind("Grey"); pos != std::string::npos && pos == s.size() - 4) {
+            s = s.substr(0, pos);
+        }
+        return s;
+    };
+    std::unordered_set<std::string> seen_grey;
+    std::unordered_set<std::string> seen_colored;
+    for (const auto& m : matches) {
+        const std::string base = base_name(m.templ_name);
+        if (m.templ_name.find("Grey") != std::string::npos) {
+            seen_grey.insert(base);
+        }
+        else {
+            seen_colored.insert(base);
+        }
+    }
+    // 同时跟全主题模板表对照：如果某 base 在配置里**只有** Grey 模板，
+    // 说明它的"灰色"实际上就是彩色（典型：RogueTrader），不能当 visited。
+    auto is_grey_template_meaningful = [&](const std::string& templ) -> bool {
+        if (templ.find("Grey") == std::string::npos) return false;
+        const std::string base = base_name(templ);
+        // 当前帧或全图任一处看到过该 base 的非 Grey 版本，就认为 Grey 有意义
+        if (seen_colored.contains(base)) return true;
+        // 模板配置里查：该 base 是否有非 Grey 模板
+        auto task_info = Task.get<MatchTaskInfo>(m_config->get_theme() + "@RoguelikeRoutingNodeAnalyze");
+        if (task_info) {
+            for (const auto& t : task_info->templ_names) {
+                std::string tb = base_name(t);
+                if (tb == base && t.find("Grey") == std::string::npos) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // 按 x 把节点划成屏幕上的列
+    struct ScreenNode
+    {
+        std::string id;
+        Rect rect;
+        std::string templ;
+        RoguelikeNodeType type;
+        bool visited = false;
+        size_t col_in_screen = 0;
+    };
+    std::vector<std::vector<ScreenNode>> per_col;
+    int curr_x = -m_node_width - 1;
+    for (const auto& m : matches) {
+        if (m.rect.x >= curr_x + m_node_width) {
+            per_col.emplace_back();
+            curr_x = m.rect.x;
+        }
+        ScreenNode sn;
+        sn.rect = m.rect;
+        sn.templ = m.templ_name;
+        sn.type = RoguelikeMapInfo.templ2type(m_config->get_theme(), m.templ_name);
+        sn.visited = is_grey_template_meaningful(m.templ_name);
+        sn.col_in_screen = per_col.size() - 1;
+        per_col.back().push_back(sn);
+    }
+    for (auto& col : per_col) {
+        std::sort(col.begin(), col.end(),
+                  [](const ScreenNode& a, const ScreenNode& b) { return a.rect.y < b.rect.y; });
+    }
+
+    // 给每个屏幕节点分配 nXX_Y id（X 是屏幕列号，Y 是从上到下行号）
+    size_t total = 0;
+    for (size_t c = 0; c < per_col.size(); ++c) {
+        for (size_t r = 0; r < per_col[c].size(); ++r) {
+            per_col[c][r].id = "n" + std::to_string(c) + "_" + std::to_string(r);
+            ++total;
+        }
+    }
+    Log.info(__FUNCTION__, "| screen has", per_col.size(), "columns total", total, "nodes");
+    for (size_t c = 0; c < per_col.size(); ++c) {
+        size_t visited_n = 0;
+        for (const auto& sn : per_col[c]) if (sn.visited) ++visited_n;
+        Log.info(__FUNCTION__, "| col", c, "size", per_col[c].size(),
+                 "x≈", per_col[c].empty() ? 0 : per_col[c][0].rect.x,
+                 "visited_count", visited_n);
+    }
+
+    if (per_col.empty()) {
+        Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-ExitThenAbandon");
+        return true;
+    }
+
+    // 找到第一个**含至少一个 unvisited 节点**的列作为当前可走候选；
+    // 该列里只有 unvisited 节点才作为可点击候选。
+    size_t reachable_col_idx = per_col.size();
+    for (size_t c = 0; c < per_col.size(); ++c) {
+        bool has_unvisited = false;
+        for (const auto& sn : per_col[c]) {
+            if (!sn.visited) {
+                has_unvisited = true;
+                break;
+            }
+        }
+        if (has_unvisited) {
+            reachable_col_idx = c;
+            break;
+        }
+    }
+    if (reachable_col_idx == per_col.size()) {
+        Log.warn(__FUNCTION__, "| no column with unvisited nodes, abandon");
+        Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-ExitThenAbandon");
+        return true;
+    }
+    Log.info(__FUNCTION__, "| reachable column index =", reachable_col_idx);
+    const auto& reachable_col = per_col[reachable_col_idx];
+
+    json::array nodes_json;
+    json::array reachable_ids_json;
+    for (const auto& col : per_col) {
+        for (const auto& sn : col) {
+            json::value item;
+            item["id"] = sn.id;
+            item["raw_type"] = type2name(sn.type);
+            item["depth_from_start"] = static_cast<int>(sn.col_in_screen);
+            item["reachable_now"] = (sn.col_in_screen == reachable_col_idx) && !sn.visited;
+            item["visited"] = sn.visited;
+            json::array click_point;
+            click_point.emplace_back(sn.rect.x + sn.rect.width / 2);
+            click_point.emplace_back(sn.rect.y + sn.rect.height / 2);
+            item["click_point"] = std::move(click_point);
+            nodes_json.emplace_back(std::move(item));
+        }
+    }
+    for (const auto& sn : reachable_col) {
+        if (!sn.visited) {
+            reachable_ids_json.emplace_back(sn.id);
+        }
+    }
+
+    json::value ctx;
+    ctx["current_roster_summary"] = vlm->current_roster_summary();
+    ctx["all_nodes_in_floor"] = std::move(nodes_json);
+    ctx["reachable_node_ids"] = std::move(reachable_ids_json);
+    ctx["current_node_id"] = "start_or_previous";
+    ctx["planned_path_so_far"] = json::array {};
+    ctx["note"] =
+        "请直接看截图判断地图状态：左下角的图标读取 floor/hope/hp/思绪 等数值。"
+        "all_nodes_in_floor 是当前屏幕上识别到的所有节点（屏幕最左列已是当前可走的下一步候选）。"
+        "节点 id 的格式是 nCOL_ROW（屏幕列号_行号），仅用于和 click_point 一一对应。"
+        "只允许从 reachable_node_ids 里选下一步。";
+
+    auto resp = vlm->request_decision("/decide/map_node", live_image, ctx);
+    if (!resp || !resp->is_object()) {
+        Log.error(__FUNCTION__, "| VLM did not return a valid decision, abandon");
+        Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-ExitThenAbandon");
+        return true;
+    }
+
+    const auto& obj = resp->as_object();
+    auto action = obj.find("action");
+    auto node_id = obj.find("node_id");
+    if (!action || !action->is_string() || action->as_string() != "goto" || !node_id || !node_id->is_string()) {
+        Log.error(__FUNCTION__, "| VLM response missing goto/node_id, abandon");
+        Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-ExitThenAbandon");
+        return true;
+    }
+
+    const std::string picked_id = node_id->as_string();
+    const ScreenNode* picked = nullptr;
+    for (const auto& sn : reachable_col) {
+        if (!sn.visited && sn.id == picked_id) {
+            picked = &sn;
+            break;
+        }
+    }
+    if (!picked) {
+        Log.warn(__FUNCTION__, "| VLM picked unreachable id", picked_id, ", fallback to first unvisited");
+        for (const auto& sn : reachable_col) {
+            if (!sn.visited) {
+                picked = &sn;
+                break;
+            }
+        }
+    }
+    if (!picked) {
+        Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-ExitThenAbandon");
+        return true;
+    }
+
+    Point click_point(picked->rect.x + picked->rect.width / 2,
+                      picked->rect.y + picked->rect.height / 2);
+    Log.info(__FUNCTION__, "| VLM map node pick:", picked->id, type2name(picked->type),
+             "click=", click_point.to_string());
+    ctrler()->click(click_point);
+    sleep(300);
+
+    const std::string action_task = sarkaz_routing_action_for_node(picked->type);
+    if (!action_task.empty()) {
+        Task.set_task_base("RoguelikeRoutingAction", action_task);
+    }
+    else {
+        Task.set_task_base("RoguelikeRoutingAction", "Sarkaz@RoguelikeRoutingAction-ExitThenAbandon");
+    }
+    return true;
 }

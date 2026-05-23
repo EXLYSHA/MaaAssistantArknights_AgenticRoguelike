@@ -111,9 +111,37 @@
         "algorithm": "JustReturn",
         "next": ["Sarkaz@Roguelike@ExitThenAbandon"]
     },
+    "Sarkaz@RoguelikeRoutingAction-StageCombatOpsEnter": {
+        "algorithm": "JustReturn",
+        "next": ["Sarkaz@Roguelike@StageCombatOpsEnter"]
+    },
+    "Sarkaz@RoguelikeRoutingAction-StageEmergencyOpsEnter": {
+        "algorithm": "JustReturn",
+        "next": ["Sarkaz@Roguelike@StageEmergencyOpsEnter"]
+    },
+    "Sarkaz@RoguelikeRoutingAction-StageDreadfulFoeEnter": {
+        "algorithm": "JustReturn",
+        "next": ["Sarkaz@Roguelike@StageDreadfulFoeEnter"]
+    },
     "Sarkaz@RoguelikeRoutingAction-StageEncounterEnter": {
         "algorithm": "JustReturn",
         "next": ["Sarkaz@Roguelike@StageEncounterEnter"]
+    },
+    "Sarkaz@RoguelikeRoutingAction-StageBoonsEnter": {
+        "algorithm": "JustReturn",
+        "next": ["Sarkaz@Roguelike@StageBoonsEnter"]
+    },
+    "Sarkaz@RoguelikeRoutingAction-StageSafeHouseEnter": {
+        "algorithm": "JustReturn",
+        "next": ["Sarkaz@Roguelike@StageSafeHouseEnter"]
+    },
+    "Sarkaz@RoguelikeRoutingAction-StageFilterTruthEnter": {
+        "algorithm": "JustReturn",
+        "next": ["Sarkaz@Roguelike@StageFilterTruthEnter"]
+    },
+    "Sarkaz@RoguelikeRoutingAction-StageBoskyPassageEnter": {
+        "algorithm": "JustReturn",
+        "next": ["Sarkaz@Roguelike@StageBoskyPassageEnter"]
     },
     "Sarkaz@RoguelikeRoutingAction-StageTraderEnter": {
         "algorithm": "JustReturn",

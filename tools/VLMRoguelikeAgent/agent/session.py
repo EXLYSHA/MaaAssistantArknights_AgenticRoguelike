@@ -37,6 +37,7 @@ class Session:
     decision_log: list[DecisionLog] = field(default_factory=list)
 
     inspect_rounds: dict[str, int] = field(default_factory=dict)
+    inspected_operators: dict[str, list[str]] = field(default_factory=dict)
 
     def log(self, endpoint: str, summary: str, response: dict) -> None:
         self.decision_log.append(

@@ -30,6 +30,7 @@ from agent.decisions.level_reward import LevelRewardHandler
 from agent.decisions.map_node import MapNodeHandler
 from agent.decisions.pre_battle_team import PreBattleTeamHandler
 from agent.decisions.recruit import RecruitHandler
+from agent.decisions.recruit_combo import RecruitComboHandler
 from agent.decisions.shopping import ShoppingHandler
 from agent.decisions.skill_selection import SkillSelectionHandler
 from agent.decisions.squad import SquadHandler
@@ -342,6 +343,7 @@ def debug_event_screenshot(event_id: int, index: int) -> FileResponse:
 _HANDLERS = {
     "/decide/squad": SquadHandler(),
     "/decide/recruit": RecruitHandler(),
+    "/decide/recruit_combo": RecruitComboHandler(),
     "/decide/skill_selection": SkillSelectionHandler(),
     "/decide/pre_battle_team": PreBattleTeamHandler(),
     "/decide/encounter": EncounterHandler(),
@@ -374,6 +376,11 @@ def decide_squad(req: DecisionRequest) -> dict:
 @app.post("/decide/recruit")
 def decide_recruit(req: DecisionRequest) -> dict:
     return _dispatch("/decide/recruit", req)
+
+
+@app.post("/decide/recruit_combo")
+def decide_recruit_combo(req: DecisionRequest) -> dict:
+    return _dispatch("/decide/recruit_combo", req)
 
 
 @app.post("/decide/skill_selection")

@@ -58,7 +58,6 @@ class BaseHandler:
             f"- 目标: {session.goal_hint}",
             f"- 难度: {session.difficulty}",
             f"- 分队: {session.squad or '未知'}",
-            f"- 楼层/希望/生命: {session.floor}/{session.hope}/{session.hp}",
             f"- 已招干员: {[op.get('name') for op in session.roster if op.get('name')]}",
             f"- 已有藏品: {session.relics}",
         ]

@@ -39,13 +39,17 @@ class ShoppingHandler(BaseHandler):
             if isinstance(item, dict) and item.get("type") == "relic" and item.get("name")
         ]
         current_relics = ctx.get("current_relics") or session.relics
+        relics_text = relic_brief(current_relics + item_relics) or "（PRTS 没找到这些藏品资料）"
         return (
             f"楼层 {ctx.get('floor')} 希望 {ctx.get('hope')}\n"
             f"商品: {ctx.get('shop_items')}\n"
             f"队伍: {ctx.get('current_roster_summary')}\n"
             f"藏品: {current_relics}\n"
-            f"相关藏品效果:\n{relic_brief(current_relics + item_relics) or '无'}\n"
-            "请返回要买的商品下标列表（按购买顺序，可空）。"
+            f"PRTS 相关藏品效果（**必读**）:\n{relics_text}\n"
+            "决策步骤：\n"
+            "1) 通读上面 PRTS 资料；\n"
+            "2) 对每个考虑买的藏品，在 reasoning 里**显式引用** PRTS 对应条目里的效果描述，解释为何要买；\n"
+            "3) 返回要买的商品下标列表（按购买顺序，可空）。"
         )
 
     def update_session(self, session: Session, req: DecisionRequest, decision: dict) -> None:
@@ -80,6 +84,13 @@ class ShoppingHandler(BaseHandler):
                 valid.append(idx)
                 remaining_hope -= price
         decision["purchases"] = valid
+        if valid:
+            reasoning = str(decision.get("reasoning") or "")
+            if len(reasoning) < 30:
+                return self._fallback_decision(
+                    session, req,
+                    "购物 reasoning 太短，必须基于 PRTS 藏品资料解释为何买（>=30 字符）",
+                )
         return decision
 
     def tool_schema(self) -> dict:
